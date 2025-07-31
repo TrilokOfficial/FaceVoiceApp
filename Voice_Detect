@@ -1,0 +1,42 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import sounddevice as sd
+import numpy as np
+from pyAudioAnalysis import audioSegmentation as aS
+from resemblyzer import VoiceEncoder
+from sklearn.cluster import DBSCAN
+
+def record(duration=10, sr=16000):
+    print(f"Recording {duration} seconds...")
+    audio = sd.rec(int(duration * sr), samplerate=sr, channels=1, dtype='float32')
+    sd.wait()
+    return audio.flatten(), sr
+
+def detect_speakers(duration=10):
+    y, sr = record(duration)
+    segments = aS.silence_removal(y, sr, 0.05, 0.05, smooth_window=0.5, weight=0.3)
+    print("Detected speech segments:", segments)
+
+    encoder = VoiceEncoder()
+    embeddings = []
+    for start, end in segments:
+        seg = y[int(start*sr):int(end*sr)]
+        if len(seg)/sr < 0.5:
+            continue
+        emb = encoder.embed_utterance(seg)
+        embeddings.append(emb)
+
+    if not embeddings:
+        print("No speech detected.")
+        return 0
+
+    X = np.vstack(embeddings)
+    labels = DBSCAN(eps=0.5, min_samples=1).fit_predict(X)
+    unique = set(labels)
+    num = len(unique - {-1})
+    print(f"Detected {num} distinct speaker(s).")
+    return num
+
+if __name__ == "__main__":
+    detect_speakers(duration=10)
