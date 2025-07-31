@@ -1,0 +1,104 @@
+import cv2, threading, time
+import sounddevice as sd, webrtcvad
+import numpy as np
+from resemblyzer import VoiceEncoder
+from sklearn.cluster import DBSCAN
+
+running = True
+face_count_history = []
+speech_segments = []
+
+def video_thread():
+    global running
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades +
+                                         "haarcascade_frontalface_default.xml")
+    window = "Live Detection"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+    while running:
+        ret, frame = cap.read()
+        if not ret: break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+        face_count_history.append(len(faces))
+
+        for x, y, w, h in faces:
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (255,0,0), 2)
+        cv2.putText(frame, f"Faces: {len(faces)}", (10,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+
+        x, y, w, h = cv2.getWindowImageRect(window)
+        if x == -1:
+            running = False
+            break
+
+        resized = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+        cv2.imshow(window, resized)
+
+        key = cv2.waitKey(1)
+        if key == ord('q'):
+            running = False
+            break
+        elif key == ord('f'):
+            cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN)
+        elif key == ord('n'):
+            cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_NORMAL)
+
+    cap.release()
+    cv2.destroyAllWindows()
+    running = False
+
+def audio_thread():
+    global running
+    vad = webrtcvad.Vad(2)
+    sr = 16000
+    frame_ms = 30
+    frame_samples = int(sr * frame_ms / 1000)
+
+    with sd.InputStream(channels=1, samplerate=sr, dtype='int16') as stream:
+        while running:
+            data, _ = stream.read(frame_samples)
+            if vad.is_speech(data.tobytes(), sr):
+                speech_segments.append(data.flatten())
+            time.sleep(0.001)
+
+def process_results():
+    max_faces = max(face_count_history) if face_count_history else 0
+    y = np.concatenate(speech_segments) if speech_segments else np.array([], dtype=np.int16)
+    sr = 16000
+
+    if y.size == 0:
+        voice_count = 0
+    else:
+        encoder = VoiceEncoder()
+        embeds = []
+        segment_size = sr  # 1 second
+        for i in range(0, len(y), segment_size):
+            chunk = y[i:i+segment_size].astype(np.float32) / 32768
+            if len(chunk) >= sr // 2:
+                embeds.append(encoder.embed_utterance(chunk))
+        if embeds:
+            labels = DBSCAN(eps=0.5, min_samples=1).fit_predict(np.vstack(embeds))
+            voice_count = len(set(labels) - {-1})
+        else:
+            voice_count = 0
+
+    print("\n✅ Final results:")
+    print(f"• Max simultaneous faces: {max_faces}")
+    print(f"• Distinct voices: {voice_count}")
+    if max_faces > 1:
+        print("Please remove the background face")
+    if voice_count > 1:
+        print("Please remove the background voice")
+
+if __name__ == "__main__":
+    print("Running... press 'q' or close window to finish.")
+    threading.Thread(target=video_thread, daemon=True).start()
+    threading.Thread(target=audio_thread, daemon=True).start()
+    while running:
+        time.sleep(0.1)
+    process_results()
