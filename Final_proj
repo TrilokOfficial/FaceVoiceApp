@@ -1,4 +1,3 @@
-# FaceVoiceApp
 # app.py – Complete FastAPI App with Colorful UI (Fixed)
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -145,46 +144,85 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Convert to grayscale for face detection
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     
+                    # Improve image quality for better detection
+                    gray = cv2.equalizeHist(gray)
+                    
                     # Load face cascade classifier
                     face_cascade = cv2.CascadeClassifier(
                         cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
                     )
                     
-                    # Detect faces with more restrictive parameters to reduce false positives
+                    # Primary face detection with balanced parameters
                     faces = face_cascade.detectMultiScale(
                         gray, 
-                        scaleFactor=1.05,  # Smaller scale factor for better accuracy
-                        minNeighbors=6,    # Higher neighbor requirement
-                        minSize=(50, 50),  # Larger minimum size
-                        maxSize=(300, 300), # Maximum size limit
+                        scaleFactor=1.1,    # Good balance of speed and accuracy
+                        minNeighbors=5,     # Reasonable neighbor requirement
+                        minSize=(40, 40),   # Smaller minimum for distant faces
+                        maxSize=(300, 300), # Keep max size limit
                         flags=cv2.CASCADE_SCALE_IMAGE
                     )
                     
-                    # Additional validation to filter out false positives
+                    # Simple but effective validation
                     valid_faces = []
                     for (x, y, w, h) in faces:
-                        # Check aspect ratio (faces are roughly square to slightly rectangular)
+                        # Basic aspect ratio check (human faces)
                         aspect_ratio = w / h
-                        if 0.7 <= aspect_ratio <= 1.3:  # Valid face aspect ratio
-                            # Check if the detected region has enough variation (not a plain surface)
+                        if 0.6 <= aspect_ratio <= 1.5:  # More lenient range
+                            # Check for reasonable texture (not completely flat)
                             face_region = gray[y:y+h, x:x+w]
                             if face_region.size > 0:
                                 std_dev = np.std(face_region)
-                                if std_dev > 15:  # Enough texture variation
+                                if std_dev > 10:  # Lower threshold for better detection
+                                    # Check if face region isn't too dark or too bright
+                                    mean_val = np.mean(face_region)
+                                    if 20 <= mean_val <= 230:
+                                        valid_faces.append((x, y, w, h))
+                    
+                    # If no faces found with strict parameters, try more lenient detection
+                    if len(valid_faces) == 0:
+                        backup_faces = face_cascade.detectMultiScale(
+                            gray,
+                            scaleFactor=1.05,
+                            minNeighbors=3,     # Lower neighbor requirement
+                            minSize=(30, 30),   # Even smaller minimum
+                            maxSize=(350, 350),
+                            flags=cv2.CASCADE_SCALE_IMAGE
+                        )
+                        
+                        # Apply basic validation to backup detection
+                        for (x, y, w, h) in backup_faces:
+                            aspect_ratio = w / h
+                            if 0.5 <= aspect_ratio <= 2.0:  # Very lenient
+                                face_region = gray[y:y+h, x:x+w]
+                                if face_region.size > 0 and np.std(face_region) > 8:
                                     valid_faces.append((x, y, w, h))
                     
                     faces = valid_faces
                     
-                    # Draw rectangles around valid faces
+                    # Always draw a processing indicator box in the top-left corner
+                    cv2.rectangle(frame, (10, 10), (200, 60), (0, 255, 255), 2)
+                    cv2.putText(frame, "PROCESSING", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(frame, f"Faces: {len(faces)}", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                    
+                    # Draw rectangles around detected faces
                     for i, (x, y, w, h) in enumerate(faces):
-                        # Use different colors for multiple faces
+                        # Use different bright colors for multiple faces
                         colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255)]
                         color = colors[i % len(colors)]
                         
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 3)
-                        # Add face label with confidence indicator
-                        cv2.putText(frame, f"Face {i+1}", 
-                                  (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        # Draw thicker, more visible rectangle
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), color, 4)
+                        
+                        # Add face label with background for better visibility
+                        label = f"Face {i+1}"
+                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                        cv2.rectangle(frame, (x, y-35), (x + label_size[0] + 10, y), color, -1)
+                        cv2.putText(frame, label, (x + 5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                    
+                    # If no faces detected, show a "scanning" indicator
+                    if len(faces) == 0:
+                        cv2.putText(frame, "Scanning for faces...", (50, frame.shape[0] - 30), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                     
                     # Store face count
                     sessions[user_id]["faces"].append(len(faces))
@@ -299,7 +337,7 @@ html_content = """
             flex-wrap: wrap;
         }
         
-        video {
+        video, #processed {
             width: 100%;
             max-width: 400px;
             border: 3px solid rgba(255,255,255,0.3);
@@ -415,6 +453,7 @@ html_content = """
         </div>
         
         <canvas id="canvas" style="display:none;"></canvas>
+        <canvas id="mirrorCanvas" style="display:none;"></canvas>
         
         <div class="controls">
             <button id="startBtn" onclick="start()">🚀 Start Recognition</button>
@@ -433,18 +472,23 @@ html_content = """
         let audioCtx = null;
         let processor = null;
         let frameInterval = null;
+        let mirrorInterval = null;
         let hasCollectedData = false;
         let isRunning = false;
+        let receivedProcessedFrame = false;
         
         const video = document.getElementById('video');
         const canvas = document.getElementById('canvas');
+        const mirrorCanvas = document.getElementById('mirrorCanvas');
         const ctx = canvas.getContext('2d');
+        const mirrorCtx = mirrorCanvas.getContext('2d');
         const status = document.getElementById('status');
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
         const resultsBtn = document.getElementById('resultsBtn');
         const errorDiv = document.getElementById('error');
         const output = document.getElementById('output');
+        const processedImg = document.getElementById('processed');
 
         function showError(message) {
             errorDiv.textContent = message;
@@ -465,9 +509,51 @@ html_content = """
             resultsBtn.disabled = running ? false : !hasData;
         }
 
+        function startMirrorFeed() {
+            // Mirror the live video feed to the processed side until we get processed frames
+            mirrorInterval = setInterval(() => {
+                if (!receivedProcessedFrame && video.readyState === 4) {
+                    try {
+                        mirrorCanvas.width = 640;
+                        mirrorCanvas.height = 480;
+                        mirrorCtx.drawImage(video, 0, 0, mirrorCanvas.width, mirrorCanvas.height);
+                        
+                        // Add a visual indicator that this is mirrored (not processed yet)
+                        mirrorCtx.strokeStyle = '#ffff00';
+                        mirrorCtx.lineWidth = 3;
+                        mirrorCtx.strokeRect(10, 10, 200, 60);
+                        mirrorCtx.fillStyle = '#ffff00';
+                        mirrorCtx.font = '16px Arial';
+                        mirrorCtx.fillText('WAITING...', 15, 30);
+                        mirrorCtx.font = '12px Arial';
+                        mirrorCtx.fillText('Starting processing', 15, 50);
+                        
+                        mirrorCanvas.toBlob((blob) => {
+                            if (blob && !receivedProcessedFrame) {
+                                const reader = new FileReader();
+                                reader.onloadend = () => {
+                                    if (!receivedProcessedFrame) {
+                                        processedImg.src = reader.result;
+                                    }
+                                };
+                                reader.readAsDataURL(blob);
+                            }
+                        }, 'image/jpeg', 0.8);
+                    } catch (err) {
+                        console.error('Mirror feed error:', err);
+                    }
+                } else if (receivedProcessedFrame && mirrorInterval) {
+                    // Stop mirroring once we receive processed frames
+                    clearInterval(mirrorInterval);
+                    mirrorInterval = null;
+                }
+            }, 100);
+        }
+
         async function start() {
             try {
                 updateStatus('Connecting...', false);
+                receivedProcessedFrame = false;
                 
                 // Create WebSocket connection
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -501,6 +587,9 @@ html_content = """
                             video.onloadedmetadata = resolve;
                         });
                         
+                        // Start mirroring the video feed to processed side
+                        startMirrorFeed();
+                        
                         // Start frame processing
                         startFrameProcessing();
                         
@@ -523,7 +612,7 @@ html_content = """
                         const data = JSON.parse(e.data);
                         
                         if (data.type === 'video_result') {
-                            const processedImg = document.getElementById('processed');
+                            receivedProcessedFrame = true;
                             // Smooth image updates to reduce glitching
                             processedImg.onload = () => {
                                 processedImg.style.opacity = '1';
@@ -641,12 +730,18 @@ html_content = """
 
         function stop() {
             isRunning = false;
+            receivedProcessedFrame = false;
             updateButtons(false, hasCollectedData);
             
-            // Clear frame interval
+            // Clear intervals
             if (frameInterval) {
                 clearInterval(frameInterval);
                 frameInterval = null;
+            }
+            
+            if (mirrorInterval) {
+                clearInterval(mirrorInterval);
+                mirrorInterval = null;
             }
             
             // Disconnect audio processing
@@ -668,6 +763,9 @@ html_content = """
             
             // Clear video
             video.srcObject = null;
+            
+            // Clear processed image
+            processedImg.src = '';
             
             // Keep WebSocket open for analysis if we have data
             if (!hasCollectedData && ws) {
@@ -714,4 +812,3 @@ html_content = """
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-
